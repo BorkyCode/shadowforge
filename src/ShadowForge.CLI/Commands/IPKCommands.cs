@@ -11,6 +11,7 @@ public static class IPKCommands
         var cmd = new Command("ipk", "IPK archive operations.");
         cmd.Subcommands.Add(BuildListCommand(getFactory));
         cmd.Subcommands.Add(BuildExtractCommand(getFactory));
+        cmd.Subcommands.Add(BuildPackCommand(getFactory));
         return cmd;
     }
 
@@ -77,6 +78,103 @@ public static class IPKCommands
             catch (Exception ex)
             {
                 log.LogError(ex, "Failed to extract IPK {File}", file.FullName);
+                return 1;
+            }
+        });
+        return cmd;
+    }
+
+    private static Command BuildPackCommand(Func<ParseResult, ILoggerFactory> getFactory)
+    {
+        var fileArg = new Argument<FileInfo>("file") { Description = "Original IPK archive to repack."};
+        var folderArg = new Argument<DirectoryInfo>("folder") { Description = "Folder of replacement files. Relative paths must match internal archive paths (e.g. ply/pc03/pc03_01.dds)." };
+        var outputOpt = new Option<FileInfo?>("-o") { Description = "Output IPK path (default: <original>_packed.ipk beside the original). Must not overwrite the original." };
+        var noCompressOpt = new Option<bool>("--no-compress") { Description = "Store replacement data uncompressed." };
+
+        var cmd = new Command("pack",
+            "Repack an IPK by replacing matching entries from a folder. " +
+            "Unchanged entries keep their original compressed data; matched files are zlib-compressed.");
+        cmd.Arguments.Add(fileArg);
+        cmd.Arguments.Add(folderArg);
+        cmd.Options.Add(outputOpt);
+        cmd.Options.Add(noCompressOpt);
+
+        cmd.SetAction(pr =>
+        {
+            var log = getFactory(pr).CreateLogger("ipk.pack");
+            var file = pr.GetValue(fileArg)!;
+            var folder = pr.GetValue(folderArg)!;
+            bool noCompress = pr.GetValue(noCompressOpt);
+
+            string outputPath;
+            if (pr.GetValue(outputOpt) is { } requested)
+            {
+                outputPath = requested.FullName;
+            }
+            else
+            {
+                string dir = Path.GetDirectoryName(file.FullName) ?? ".";
+                string stem = Path.GetFileNameWithoutExtension(file.FullName);
+                outputPath = Path.Combine(dir, stem + "_packed.ipk");
+            }
+
+            try
+            {
+                if (string.Equals(
+                        Path.GetFullPath(outputPath),
+                        Path.GetFullPath(file.FullName),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    log.LogError("Output must not overwrite the original IPK.");
+                    return 1;
+                }
+
+                if (!file.Exists)
+                {
+                    log.LogError("Original IPK not found: {File}", file.FullName);
+                    return 1;
+                }
+
+                if (!folder.Exists)
+                {
+                    log.LogError("Replacement folder not found: {Folder}", folder.FullName);
+                    return 1;
+                }
+
+                byte[] original = File.ReadAllBytes(file.FullName);
+                log.LogInformation("Repacking {File} with replacements from {Folder}",
+                    file.FullName, folder.FullName);
+
+                var result = ArchiveWriter.RepackFromFolder(
+                    original,
+                    folder.FullName,
+                    compressReplacements: !noCompress);
+
+                OutputPath.CreateParentDirectory(outputPath);
+                File.WriteAllBytes(outputPath, result.Data);
+
+                Console.WriteLine($"Replacement files found: {result.ReplacementCount}");
+                Console.WriteLine($"Matching IPK entries:    {result.MatchedCount}");
+                Console.WriteLine($"Unmatched files:         {result.UnmatchedPaths.Count}");
+                if (result.UnmatchedPaths.Count > 0)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine("WARNING: These files do not match an IPK entry:");
+                    foreach (var name in result.UnmatchedPaths)
+                        Console.WriteLine($"  {name}");
+                }
+
+                Console.WriteLine();
+                Console.WriteLine("IPK REPACK COMPLETE");
+                Console.WriteLine($"Original:     {file.FullName}");
+                Console.WriteLine($"Output:       {outputPath}");
+                Console.WriteLine($"Replacements: {result.MatchedCount}");
+                Console.WriteLine($"Archive size: {result.Data.Length:N0} bytes");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Failed to pack IPK {File}", file.FullName);
                 return 1;
             }
         });
