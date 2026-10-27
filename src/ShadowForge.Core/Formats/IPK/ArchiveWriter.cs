@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Text;
 using ShadowForge.IO;
 
@@ -69,25 +70,29 @@ public static class ArchiveWriter
         ms.SetLength(totalSize);
         return ms.ToArray();
     }
-	
+
     public sealed record RepackResult(
         byte[] Data,
         int ReplacementCount,
         int MatchedCount,
+        int AddedCount,
         IReadOnlyList<string> UnmatchedPaths);
 
     /// <summary>
     /// Rebuilds an existing IPK1 archive, replacing any entries whose internal path matches a
     /// file under <paramref name="replacementFolder"/> (relative paths, case-insensitive,
-    /// forward/backslash normalized). Unmatched entries keep their original compressed payload
-    /// byte-for-byte. Matched entries are zlib-compressed from the replacement file data.
-    /// Alignment and entry order from the original are preserved. The output always uses a
-    /// zlib-style entry tail so <see cref="Archive.UsesZlib"/> remains true.
+    /// forward/backslash normalized). Unmatched original entries keep their original compressed
+    /// payload byte-for-byte. Matched entries are zlib-compressed from the replacement file data.
+    /// When <paramref name="addNewFiles"/> is true, folder files that do not match any existing
+    /// entry are appended as new entries at the end of the archive. Alignment and original entry
+    /// order are preserved. The output always uses a zlib-style entry tail so
+    /// <see cref="Archive.UsesZlib"/> remains true.
     /// </summary>
     public static RepackResult RepackFromFolder(
         byte[] originalBytes,
         string replacementFolder,
-        bool compressReplacements = true)
+        bool compressReplacements = true,
+        bool addNewFiles = false)
     {
         if (!Directory.Exists(replacementFolder))
             throw new DirectoryNotFoundException($"Replacement folder not found: {replacementFolder}");
@@ -102,31 +107,54 @@ public static class ArchiveWriter
         var archiveByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < archive.Entries.Count; i++)
             archiveByKey[NormalizePath(archive.Entries[i].Name)] = i;
+		
+		char pathSeparator = DetectPathSeparator(archive.Entries);
 
         var matched = new Dictionary<int, (string RelativePath, byte[] Data)>();
+        var newFiles = new List<(string RelativePath, byte[] Data)>();
         var unmatched = new List<string>();
 
         foreach (var (key, (relative, data)) in replacements)
         {
             if (archiveByKey.TryGetValue(key, out int index))
+            {
                 matched[index] = (relative, data);
-            else
+            }
+            else if (addNewFiles)
+            {
+                string archiveName = ToArchivePath(relative, pathSeparator);
+                if (Encoding.ASCII.GetByteCount(archiveName) > Archive.NameFieldSize - 1)
+                {
+                    throw new ArgumentException(
+                        $"Entry name '{archiveName}' exceeds {Archive.NameFieldSize - 1} bytes");
+                }
+                newFiles.Add((archiveName, data));
+            }
+			else
+            {
                 unmatched.Add(relative);
+            }
         }
 
-        if (matched.Count == 0)
+        if (matched.Count == 0 && newFiles.Count == 0)
         {
             throw new InvalidOperationException(
-                "No replacement files matched the IPK. Check the folder structure and internal filenames.");
+                "No replacement files matched the IPK and no new files were added. " +
+                "Check the folder structure and internal filenames, or pass --add-new.");
         }
 
-        var blobs = new byte[archive.Entries.Count][];
-        var isCompressed = new bool[archive.Entries.Count];
-        var originalSizes = new uint[archive.Entries.Count];
+        int totalEntries = archive.Entries.Count + newFiles.Count;
+
+        var names = new string[totalEntries];
+        var blobs = new byte[totalEntries][];
+        var isCompressed = new bool[totalEntries];
+        var originalSizes = new uint[totalEntries];
 
         for (int i = 0; i < archive.Entries.Count; i++)
         {
             var entry = archive.Entries[i];
+            names[i] = entry.Name;
+
             if (matched.TryGetValue(i, out var repl))
             {
                 byte[] payload = compressReplacements
@@ -147,16 +175,28 @@ public static class ArchiveWriter
             }
         }
 
+        // Appended new files.
+        for (int n = 0; n < newFiles.Count; n++)
+        {
+            int i = archive.Entries.Count + n;
+            var (relative, data) = newFiles[n];
+            names[i] = relative;
+            byte[] payload = compressReplacements ? CompressZlib(data) : data;
+            blobs[i] = payload;
+            isCompressed[i] = compressReplacements;
+            originalSizes[i] = (uint)data.Length;
+        }
+
         uint alignment = archive.Alignment;
         if (alignment == 0 || (alignment & (alignment - 1)) != 0)
             throw new InvalidDataException($"Invalid alignment: {alignment}");
 
-        uint tableEnd = (uint)(Archive.HeaderSize + Archive.EntryRecordSize * archive.Entries.Count);
+        uint tableEnd = (uint)(Archive.HeaderSize + Archive.EntryRecordSize * totalEntries);
         uint dataStart = Align.Up(tableEnd, alignment);
 
-        var offsets = new uint[archive.Entries.Count];
+        var offsets = new uint[totalEntries];
         uint cursor = dataStart;
-        for (int i = 0; i < archive.Entries.Count; i++)
+        for (int i = 0; i < totalEntries; i++)
         {
             cursor = Align.Up(cursor, alignment);
             offsets[i] = cursor;
@@ -170,14 +210,13 @@ public static class ArchiveWriter
 
         writer.Write(Archive.Magic);
         writer.Write(alignment);
-        writer.Write((uint)archive.Entries.Count);
+        writer.Write((uint)totalEntries);
         writer.Write(totalSize);
 
-        for (int i = 0; i < archive.Entries.Count; i++)
+        for (int i = 0; i < totalEntries; i++)
         {
-            var entry = archive.Entries[i];
             var nameBytes = new byte[Archive.NameFieldSize];
-            Encoding.ASCII.GetBytes(entry.Name, 0, entry.Name.Length, nameBytes, 0);
+            Encoding.ASCII.GetBytes(names[i], 0, names[i].Length, nameBytes, 0);
             writer.Write(nameBytes);
 
             writer.Write(isCompressed[i] ? 1u : 0u);
@@ -194,10 +233,10 @@ public static class ArchiveWriter
         while (ms.Position < dataStart)
             writer.Write((byte)0);
 
-        for (int i = 0; i < archive.Entries.Count; i++)
+        for (int i = 0; i < totalEntries; i++)
         {
             if (ms.Position > offsets[i])
-                throw new InvalidDataException($"Overlapping data while writing {archive.Entries[i].Name}");
+                throw new InvalidDataException($"Overlapping data while writing {names[i]}");
             while (ms.Position < offsets[i])
                 writer.Write((byte)0);
             writer.Write(blobs[i]);
@@ -207,7 +246,7 @@ public static class ArchiveWriter
             writer.Write((byte)0);
 
         ms.SetLength(totalSize);
-        return new RepackResult(ms.ToArray(), replacements.Count, matched.Count, unmatched);
+        return new RepackResult(ms.ToArray(), replacements.Count, matched.Count, newFiles.Count, unmatched);
     }
 
     private static byte[] CompressZlib(byte[] data)
@@ -241,4 +280,28 @@ public static class ArchiveWriter
 
     private static string NormalizePath(string name) =>
         name.Replace('\\', '/').Trim('/').ToLowerInvariant();
+
+    private static char DetectPathSeparator(IReadOnlyList<FileEntry> entries)
+    {
+        int backslash = 0, slash = 0;
+        foreach (var entry in entries)
+        {
+            foreach (char c in entry.Name)
+            {
+                if (c == '\\') backslash++;
+                else if (c == '/') slash++;
+            }
+        }
+        if (slash > backslash)
+            return '/';
+        return '\\';
+    }
+
+    private static string ToArchivePath(string relativePath, char separator)
+    {
+        string normalized = relativePath.Replace('\\', '/').Trim('/');
+        return separator == '/'
+            ? normalized
+            : normalized.Replace('/', '\\');
+    }
 }

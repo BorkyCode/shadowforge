@@ -25,6 +25,7 @@ public sealed class ArchiveWriterRepackTests
 
             Assert.Equal(1, result.ReplacementCount);
             Assert.Equal(1, result.MatchedCount);
+            Assert.Equal(0, result.AddedCount);
             Assert.Empty(result.UnmatchedPaths);
 
             using var ms = new MemoryStream(result.Data);
@@ -81,7 +82,7 @@ public sealed class ArchiveWriterRepackTests
     }
 
     [Fact]
-    public void RepackFromFolder_UnmatchedReported()
+    public void RepackFromFolder_UnmatchedReported_WhenNotAdding()
     {
         var original = ArchiveWriter.Build(new[]
         {
@@ -98,8 +99,91 @@ public sealed class ArchiveWriterRepackTests
             var result = ArchiveWriter.RepackFromFolder(original, folder);
             Assert.Equal(2, result.ReplacementCount);
             Assert.Equal(1, result.MatchedCount);
+            Assert.Equal(0, result.AddedCount);
             Assert.Single(result.UnmatchedPaths);
             Assert.Equal("extra.dds", result.UnmatchedPaths[0]);
+        }
+        finally
+        {
+            if (Directory.Exists(folder))
+                Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RepackFromFolder_AddNew_AppendsUnmatchedEntries()
+    {
+        var original = ArchiveWriter.Build(new[]
+        {
+            new ArchiveWriter.InputEntry("ply\\keep.dds", Encoding.ASCII.GetBytes("KEEP")),
+        }, alignment: 0x80);
+
+        string folder = Path.Combine(Path.GetTempPath(), "ipk-repack-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(folder, "ply"));
+            Directory.CreateDirectory(Path.Combine(folder, "new"));
+            File.WriteAllBytes(Path.Combine(folder, "ply", "keep.dds"), Encoding.ASCII.GetBytes("REPLACED"));
+            File.WriteAllBytes(Path.Combine(folder, "new", "extra.dds"), Encoding.ASCII.GetBytes("EXTRA_DATA"));
+
+            var result = ArchiveWriter.RepackFromFolder(
+                original, folder, compressReplacements: true, addNewFiles: true);
+
+            Assert.Equal(2, result.ReplacementCount);
+            Assert.Equal(1, result.MatchedCount);
+            Assert.Equal(1, result.AddedCount);
+            Assert.Empty(result.UnmatchedPaths);
+
+            using var ms = new MemoryStream(result.Data);
+            var archive = ArchiveReader.ReadArchive(ms);
+            Assert.Equal(2u, archive.FileCount);
+            Assert.True(archive.UsesZlib);
+
+            Assert.Equal("ply\\keep.dds", archive.Entries[0].Name);
+            Assert.Equal("new\\extra.dds", archive.Entries[1].Name);
+
+            using var out0 = new MemoryStream();
+            ms.Position = 0;
+            ArchiveReader.ExtractEntry(ms, archive.Entries[0], out0, useZlib: true);
+            Assert.Equal("REPLACED", Encoding.ASCII.GetString(out0.ToArray()));
+
+            using var out1 = new MemoryStream();
+            ms.Position = 0;
+            ArchiveReader.ExtractEntry(ms, archive.Entries[1], out1, useZlib: true);
+            Assert.Equal("EXTRA_DATA", Encoding.ASCII.GetString(out1.ToArray()));
+        }
+        finally
+        {
+            if (Directory.Exists(folder))
+                Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RepackFromFolder_AddNewOnly_WithNoMatches_Succeeds()
+    {
+        var original = ArchiveWriter.Build(new[]
+        {
+            new ArchiveWriter.InputEntry("only.dds", new byte[] { 1, 2, 3 }),
+        });
+
+        string folder = Path.Combine(Path.GetTempPath(), "ipk-repack-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(folder);
+            File.WriteAllBytes(Path.Combine(folder, "brand_new.dds"), new byte[] { 9, 8, 7 });
+
+            var result = ArchiveWriter.RepackFromFolder(
+                original, folder, compressReplacements: true, addNewFiles: true);
+
+            Assert.Equal(0, result.MatchedCount);
+            Assert.Equal(1, result.AddedCount);
+
+            using var ms = new MemoryStream(result.Data);
+            var archive = ArchiveReader.ReadArchive(ms);
+            Assert.Equal(2u, archive.FileCount);
+            Assert.Equal("only.dds", archive.Entries[0].Name);
+            Assert.Equal("brand_new.dds", archive.Entries[1].Name);
         }
         finally
         {
